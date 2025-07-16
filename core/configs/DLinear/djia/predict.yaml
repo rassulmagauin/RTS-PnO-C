@@ -1,0 +1,34 @@
+Experiment:
+    exp_id: DLinear/djia_predict
+Hardware:
+    random_seed: 2021
+    num_workers: 2
+    gpu: 0
+    use_multi_gpu: false
+    gpus: null
+Dataset:
+    root_path: ../dataset
+    data_path: stock_data.csv
+    task_type: U
+    univariate: djia
+    date_col: dt
+    n_vars: 1
+    seq_len: 150
+    label_len: 0
+    pred_len: 30
+    interval: 1
+    standardize: true
+    enc_freq: d
+Model:
+    model: DLinear
+    decomp_ksize: 25
+    shared_proj: true
+Training:
+    criterion: MSE
+    train_epochs: 100
+    patience: 3
+    batch_size: 32
+    lr: 0.00001
+    lr_scheduler: fixed
+Conformal:
+    error_rate: 0.05

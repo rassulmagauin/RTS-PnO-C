@@ -1,0 +1,44 @@
+Experiment:
+    exp_id: FEDformer/djia_predict
+Hardware:
+    random_seed: 2021
+    num_workers: 2
+    gpu: 0
+    use_multi_gpu: false
+    gpus: null
+Dataset:
+    root_path: ../dataset
+    data_path: stock_data.csv
+    task_type: U
+    univariate: djia
+    date_col: dt
+    n_vars: 1
+    seq_len: 150
+    label_len: 15
+    pred_len: 30
+    interval: 1
+    standardize: true
+    enc_freq: null
+Model:
+    model: FEDformer
+    pos_enc: none
+    temp_enc: none
+    e_layers: 2
+    d_layers: 1
+    d_model: 512
+    n_heads: 8
+    n_modes: 64
+    d_ff: 2048
+    decomp_ksizes:
+    - 24
+    activation: gelu
+    dropout: 0.05
+Training:
+    criterion: MSE
+    train_epochs: 100
+    patience: 3
+    batch_size: 32
+    lr: 0.0001
+    lr_scheduler: fixed
+Conformal:
+    error_rate: 0.05
