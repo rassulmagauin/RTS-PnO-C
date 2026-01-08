@@ -2,7 +2,7 @@ Experiment:
     exp_id: PatchTST/sp500_pno
 Hardware:
     random_seed: 2021
-    num_workers: 2
+    num_workers: 1
     gpu: 0
     use_multi_gpu: false
     gpus: null

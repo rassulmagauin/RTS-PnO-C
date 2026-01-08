@@ -14,6 +14,7 @@ from .data_provider import get_allocating_loader_and_dataset
 import models
 from models.Allocate import AllocateModel
 from common.experiment import Experiment, EarlyStopping
+from utils.case_logger import CaseLogger
 
 class PnOExperiment(Experiment):
     def __init__(self, configs):
@@ -155,14 +156,24 @@ class PnOExperiment(Experiment):
             loss = sol_cost - optimal_cost
         if allocate_model.modelSense == pyepo.EPO.MAXIMIZE:
             loss = optimal_cost - sol_cost
-        return loss
+        return loss, sol
 
     @torch.no_grad()
-    def evaluate_regret(self, eval_loader, scaler=None):
+    def evaluate_regret(self, eval_loader, scaler=None, log_cases=False):
         self.forecast_model.eval()
         loss = 0
         rel_loss = 0
         trial = 0
+
+        # Initialize Logger
+        logger = None
+        if log_cases:
+            cases_dir = os.path.join(self.exp_dir, "cases_test")
+            os.makedirs(cases_dir, exist_ok=True)
+            # Use 'pno_cases.jsonl' to distinguish from mpc
+            logger = CaseLogger(os.path.join(cases_dir, "pno_cases.jsonl"))
+
+        count = 0
 
         for batch in eval_loader:
             batch = [tensor.to(self.device) for tensor in batch]
@@ -184,9 +195,23 @@ class PnOExperiment(Experiment):
             # Solve
             for j in range(batch_y_pred.shape[0]):
                 # accumulate loss
-                this_regret = self._cal_regret(self.allocate_model, batch_y_pred[j], batch_y[j])
+                this_regret, this_alloc = self._cal_regret(self.allocate_model, batch_y_pred[j], batch_y[j])
                 loss += this_regret
+
+                min_val = np.min(batch_y[j])
+                this_rel_regret = (this_regret / min_val) if min_val != 0 else 0
                 rel_loss += (this_regret / np.min(batch_y[j]))
+
+                if logger:
+                    count += 1
+                    logger.log({
+                        "case_id": count,
+                        "algo": "pno",
+                        "regret": float(this_regret),
+                        "rel_regret": float(this_rel_regret),
+                        "alloc": this_alloc.tolist() if isinstance(this_alloc, np.ndarray) else list(this_alloc),
+                        "true_prices": batch_y[j].tolist()
+                    })
 
             trial += batch_x.shape[0]
 
@@ -199,7 +224,7 @@ class PnOExperiment(Experiment):
         
     @torch.no_grad()
     def evaluate(self, eval_loader, scaler, criterion=None, load_best=False, save_result=False):
-        eval_regret = self.evaluate_regret(eval_loader, scaler)
+        eval_regret = self.evaluate_regret(eval_loader, scaler, log_cases=save_result)
         _, eval_metrics = self.evaluate_forecast(eval_loader, criterion, load_best)
         eval_metrics['Regret'] = eval_regret['abs_regret']
         eval_metrics['Rel Regret'] = eval_regret['rel_regret']

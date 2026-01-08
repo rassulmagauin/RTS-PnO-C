@@ -46,9 +46,9 @@ if __name__ == '__main__':
     # Remove the previous experiment with the same `exp_id`.
     exp_dir = os.path.join('output', configs['Experiment']['exp_id'])
     if os.path.exists(exp_dir):
-        print(f'Experiment {exp_dir} exists, delete and continue? [Y/N]', end=' ')
+        # print(f'Experiment {exp_dir} exists, delete and continue? [Y/N]', end=' ')
 
-        response = input()
+        response = 'Y'
         while response not in ['Y', 'N']:
             print('Invalid choice. Choose between [Y/N]', end=' ')
             response = input()

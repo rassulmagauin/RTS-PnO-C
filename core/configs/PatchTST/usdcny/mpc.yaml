@@ -3,7 +3,7 @@ Experiment:
     # This MUST match the folder name of your baseline run
     prev_exp_id: PatchTST/usdcny_pno
     # The constraint: "Spend at most 25% of remaining budget per step"
-    mpc_first_step_cap: 1.0        
+    mpc_first_step_cap: 0.25  
 
 Hardware:
     random_seed: 2021

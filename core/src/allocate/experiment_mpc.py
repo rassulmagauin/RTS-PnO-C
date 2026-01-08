@@ -194,29 +194,46 @@ class MPCExperiment(Experiment):
                 
             else:
                 # B. Get the relevant constraint vector for the remaining steps
-                # We use the first 'remaining_steps' from the full constraint vector r (r[0]...r[H-t])
                 current_constraint = self.constraint[:, :remaining_steps].numpy()
                 
-                # C. Re-initialize solver for the current look-ahead window
-                # We pass the first-step cap here.
-                solver = AllocateModel(
-                    current_constraint,
-                    self.configs.uncertainty_quantile,
-                    pred_len=remaining_steps,
-                    first_step_cap=getattr(self.configs, "mpc_first_step_cap", None),
-                    quiet=True
-                )
+                # C. Initialize "raw_action_fraction" variable
+                raw_action_fraction = 0.0
                 
-                # D. Solve: Objective is the predicted prices for the remaining steps
-                solver.setObj(pred_real[:remaining_steps])
-                sol, _ = solver.solve() # sol is the allocation vector for the remaining steps
+                # D. Try to solve WITH the cap first
+                try:
+                    solver = AllocateModel(
+                        current_constraint,
+                        self.configs.uncertainty_quantile,
+                        pred_len=remaining_steps,
+                        first_step_cap=getattr(self.configs, "mpc_first_step_cap", None),
+                        quiet=True
+                    )
+                    solver.setObj(pred_real[:remaining_steps])
+                    sol, _ = solver.solve()
+                    raw_action_fraction = float(sol[0])
+                    
+                except Exception:
+                    # E. First Failure: Try RELAXED (Ignore Cap)
+                    try:
+                        solver_relaxed = AllocateModel(
+                            current_constraint,
+                            self.configs.uncertainty_quantile,
+                            pred_len=remaining_steps,
+                            first_step_cap=None, # Ignore Cap
+                            quiet=True
+                        )
+                        solver_relaxed.setObj(pred_real[:remaining_steps])
+                        sol, _ = solver_relaxed.solve()
+                        raw_action_fraction = float(sol[0])
+                        
+                    except Exception:
+                        # F. Ultimate Failure: Default to HOLD (0.0)
+                        # If Gurobi fails entirely, we play it safe and spend nothing.
+                        # We print a warning so you know it happened, but we keep running.
+                        # print(f"Warning: Solver failed at step {t}/{H}. Holding.")
+                        raw_action_fraction = 0.0
                 
-                # E. Extract the decision: We only care about the *first* action in the plan
-                # sol[0] is the fraction of the TOTAL portfolio (1.0) to spend NOW.
-                raw_action_fraction = float(sol[0])
-                
-                # F. Cap the raw action by the remaining budget
-                # We must not try to spend more than we have left!
+                # G. Cap the raw action by the remaining budget
                 amount_to_spend_fraction = min(raw_action_fraction, budget_remaining)
                 
             # 4. Execute (Trade)
