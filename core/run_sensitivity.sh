@@ -5,10 +5,10 @@
 # ==============================================================================
 
 # 1. Define Datasets (Excluding usdcny as you already have it)
-DATASETS=("usdcny")
+DATASETS=("coinbase")
 
 # 2. Define Budget Caps to test
-CAPS=(0.1 0.25 0.5 0.75 1.0)
+CAPS=(0.8 0.9 1.0)
 
 PYTHON_EXEC="python"
 

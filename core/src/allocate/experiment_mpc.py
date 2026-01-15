@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import gurobipy as gp
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 import models
 from models.Allocate import AllocateModel
@@ -49,23 +50,23 @@ class MPCExperiment(Experiment):
         self.constraint = torch.load(constraint_path, map_location='cpu')
         if self.constraint.dim() == 1:
              self.constraint = self.constraint.unsqueeze(0)
-        # Transpose check for safety (if saved as [H, 1])
         if self.constraint.shape[0] != 1 and self.constraint.shape[1] == 1:
              self.constraint = self.constraint.T
 
     def _setup_gurobi_env(self):
         # Global Gurobi settings for determinism
-        gp.setParam("OutputFlag", 0) # Suppress Gurobi log output
-        gp.setParam("Threads", 1)    # Use a single thread
-        gp.setParam("Method", 1)     # Dual Simplex (a deterministic method)
+        gp.setParam("OutputFlag", 0) 
+        gp.setParam("Threads", 1)    
+        gp.setParam("Method", 1)     
         gp.setParam("Crossover", 0)
         gp.setParam("Seed", getattr(self.configs, "random_seed", 42))
     
     def _build_allocate_model(self):
+        # Template initialization
         self.allocate_model = AllocateModel(
             self.constraint.numpy(),
             self.configs.uncertainty_quantile,
-            pred_len=self.configs.pred_len, # Max horizon
+            pred_len=self.configs.pred_len,
             first_step_cap=getattr(self.configs, "mpc_first_step_cap", None),
             quiet=True
         )
@@ -76,37 +77,37 @@ class MPCExperiment(Experiment):
         total_regret = 0.0
         total_rel_regret = 0.0
         count = 0
-        #TODO: logger
 
-        # Setup Logger
         cases_dir = os.path.join(self.exp_dir, "cases_test")
         os.makedirs(cases_dir, exist_ok=True)
         logger = CaseLogger(os.path.join(cases_dir, "mpc_cases.jsonl"))
         
+        print("Parallelizing execution across available cores (backend='threading')...")
+        
         for batch in tqdm(self.test_loader):
-            # batch_x: Normalized history [B, Seq, 1]
-            # batch_y: Normalized future [B, Pred, 1]
             batch_x, batch_y, _, _ = batch
             
             batch_x_np = batch_x.cpu().numpy()
             batch_y_np = batch_y.cpu().numpy()
             
-            # Unscale ground truth future prices once, as this is used in the simulation
             batch_y_real = np.zeros_like(batch_y_np)
             for i in range(len(batch_y_np)):
                 batch_y_real[i] = self.scaler.inverse_transform(batch_y_np[i].reshape(-1, 1)).flatten()
 
-            # Run simulation for each sample in batch
-            for i in range(len(batch_x_np)):
-                history = batch_x_np[i].flatten()
+            # --- PARALLEL LOOP START ---
+            # Using 'threading' backend is safer for PyTorch shared memory
+            results = Parallel(n_jobs=4, backend="threading")(
+                delayed(self._run_mpc_simulation)(
+                    batch_x_np[i].flatten(), 
+                    batch_y_real[i].flatten()
+                ) for i in range(len(batch_x_np))
+            )
+            # --- PARALLEL LOOP END ---
+
+            for i, (cost, alloc) in enumerate(results):
                 future = batch_y_real[i].flatten()
                 
-                # --- CORE CALL ---
-                cost, alloc = self._run_mpc_simulation(history, future)
-                # -----------------
-                
-                # Calculate metrics
-                optimal_cost = np.min(future) # Optimal buyer buys at the minimum future price
+                optimal_cost = np.min(future)
                 regret = cost - optimal_cost
                 rel_regret = regret / optimal_cost if optimal_cost != 0 else 0
                 
@@ -114,8 +115,6 @@ class MPCExperiment(Experiment):
                 total_rel_regret += rel_regret
                 count += 1
                 
-                #TODO: logger
-                # Log
                 logger.log({
                     "case_id": count,
                     "algo": "mpc",
@@ -128,9 +127,6 @@ class MPCExperiment(Experiment):
         avg_regret = total_regret / count
         avg_rel_regret = total_rel_regret / count
 
-        # --- NEW: Construct standardized result.json ---
-        
-        # 1. Try to get MSE/MAE from the baseline (since model is identical)
         base_metrics = {}
         try:
             base_res_path = os.path.join(self.prev_exp_dir, 'result.json')
@@ -140,66 +136,49 @@ class MPCExperiment(Experiment):
         except Exception:
             pass
 
-        # 2. Construct final dictionary
         final_metrics = {
-            'MSE': base_metrics.get('MSE', -1.0),       # Copy from baseline
-            'MAE': base_metrics.get('MAE', -1.0),       # Copy from baseline
-            'Regret': avg_regret,                       # Our new MPC result
-            'Rel Regret': avg_rel_regret                # Our new MPC result
+            'MSE': base_metrics.get('MSE', -1.0),
+            'MAE': base_metrics.get('MAE', -1.0),
+            'Regret': avg_regret,
+            'Rel Regret': avg_rel_regret
         }
 
         print(f"Final MPC Results: {final_metrics}")
         
-        # 3. Save as standard 'result.json'
         res_path = os.path.join(self.exp_dir, 'result.json')
         with open(res_path, 'w') as f:
             json.dump(final_metrics, f, indent=4)
             
         return avg_regret
 
-    def _run_mpc_simulation(self, history_scaled, future_unscaled):
-        H = self.configs.pred_len # Should be 88
+    def _run_mpc_simulation(self, history_norm_flat, future_real_flat):
+        H = self.configs.pred_len
         
-        # State variables
-        # current_history is unscaled (real prices)
-        current_history_unscaled = list(self.scaler.inverse_transform(history_scaled.reshape(-1, 1)).flatten())
+        current_history_unscaled = list(self.scaler.inverse_transform(history_norm_flat.reshape(-1, 1)).flatten())
         budget_remaining = 1.0
         cost_incurred = 0.0
         actions_taken = []
         
-        # Loop through each step in the prediction horizon
         for t in range(H):
-            # 1. Prepare history for forecasting
-            # Use the last 'seq_len' real prices (the sliding window)
             hist_unscaled = np.array(current_history_unscaled[-self.configs.seq_len:]).reshape(-1, 1)
             hist_norm = self.scaler.transform(hist_unscaled)
-            hist_tensor = torch.tensor(hist_norm, dtype=torch.float32).unsqueeze(0).to(self.device)
+            hist_tensor = torch.tensor(hist_norm, dtype=torch.float32).unsqueeze(0)
             
-            # 2. Forecast
             with torch.no_grad():
-                pred_norm = self.forecast_model(hist_tensor) # [1, H, 1]
+                hist_tensor = hist_tensor.to(self.device)
+                pred_norm = self.model(hist_tensor)
             
-            # Inverse transform the forecast to get real price predictions
             pred_norm_np = pred_norm.cpu().numpy().flatten()
             pred_real = self.scaler.inverse_transform(pred_norm_np.reshape(-1, 1)).flatten()
             
-            # 3. Optimization (The MPC Step)
-            
-            # A. Determine remaining horizon and constraint
             remaining_steps = H - t
             
             if t == H - 1:
-                # If it's the last step, we must spend everything
                 amount_to_spend_fraction = budget_remaining
-                
             else:
-                # B. Get the relevant constraint vector for the remaining steps
                 current_constraint = self.constraint[:, :remaining_steps].numpy()
-                
-                # C. Initialize "raw_action_fraction" variable
                 raw_action_fraction = 0.0
                 
-                # D. Try to solve WITH the cap first
                 try:
                     solver = AllocateModel(
                         current_constraint,
@@ -211,44 +190,28 @@ class MPCExperiment(Experiment):
                     solver.setObj(pred_real[:remaining_steps])
                     sol, _ = solver.solve()
                     raw_action_fraction = float(sol[0])
-                    
                 except Exception:
-                    # E. First Failure: Try RELAXED (Ignore Cap)
                     try:
                         solver_relaxed = AllocateModel(
                             current_constraint,
                             self.configs.uncertainty_quantile,
                             pred_len=remaining_steps,
-                            first_step_cap=None, # Ignore Cap
+                            first_step_cap=None,
                             quiet=True
                         )
                         solver_relaxed.setObj(pred_real[:remaining_steps])
                         sol, _ = solver_relaxed.solve()
                         raw_action_fraction = float(sol[0])
-                        
                     except Exception:
-                        # F. Ultimate Failure: Default to HOLD (0.0)
-                        # If Gurobi fails entirely, we play it safe and spend nothing.
-                        # We print a warning so you know it happened, but we keep running.
-                        # print(f"Warning: Solver failed at step {t}/{H}. Holding.")
                         raw_action_fraction = 0.0
                 
-                # G. Cap the raw action by the remaining budget
                 amount_to_spend_fraction = min(raw_action_fraction, budget_remaining)
-                
-            # 4. Execute (Trade)
             
-            # Get the true price for the current step t
-            true_price = future_unscaled[t]
-            
-            # The actual execution cost is the *fraction of remaining budget* times the true price
+            true_price = future_real_flat[t]
             cost_incurred += amount_to_spend_fraction * true_price
             budget_remaining -= amount_to_spend_fraction
             actions_taken.append(amount_to_spend_fraction)
             
-            # 5. Update History (Slide window for the next step)
             current_history_unscaled.append(true_price)
             
         return cost_incurred, actions_taken
-
-        

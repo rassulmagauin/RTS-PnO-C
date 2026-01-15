@@ -316,6 +316,26 @@ cython_debug/
 
 
 ==================================================
+FILE: ./core/summary_usdcny_old.txt
+==================================================
+Cap_Size | Abs_Regret | Rel_Regret | MSE | MAE
+---------------------------------------------------------
+0.1      | 0.0034386831617327076 | 0.0004754966945323532 | 0.0060256170108914375 | 0.05091505125164986
+0.2      | 0.003320800402741224 | 0.0004592327139684572 | 0.0060256170108914375 | 0.05091505125164986
+0.25     | 0.003285269277900379 | 0.0004543204776192754 | 0.0060256170108914375 | 0.05091505125164986
+0.3      | 0.0032643240899862614 | 0.0004514244498924644 | 0.0060256170108914375 | 0.05091505125164986
+0.4      | 0.0032360863634844556 | 0.00044751889665177273 | 0.0060256170108914375 | 0.05091505125164986
+0.5      | 0.003219990084704034 | 0.0004452927674313593 | 0.0060256170108914375 | 0.05091505125164986
+0.6      | 0.0032299580821608985 | 0.00044667441580615685 | 0.0060256170108914375 | 0.05091505125164986
+0.75     | 0.003243180249916217 | 0.00044850787918513144 | 0.0060256170108914375 | 0.05091505125164986
+0.7      | 0.003239061775853553 | 0.00044793663190485203 | 0.0060256170108914375 | 0.05091505125164986
+0.8      | 0.0032469975813501635 | 0.00044903752697811593 | 0.0060256170108914375 | 0.05091505125164986
+0.9      | 0.0032545306800996904 | 0.0004500829058414167 | 0.0060256170108914375 | 0.05091505125164986
+1.0      | 0.0032625500660816427 | 0.00045119614023214367 | 0.0060256170108914375 | 0.05091505125164986
+
+
+
+==================================================
 FILE: ./core/src/allocate/data_provider.py
 ==================================================
 import os
@@ -610,6 +630,7 @@ from .data_provider import get_allocating_loader_and_dataset
 import models
 from models.Allocate import AllocateModel
 from common.experiment import Experiment, EarlyStopping
+from utils.case_logger import CaseLogger
 
 class PnOExperiment(Experiment):
     def __init__(self, configs):
@@ -751,14 +772,24 @@ class PnOExperiment(Experiment):
             loss = sol_cost - optimal_cost
         if allocate_model.modelSense == pyepo.EPO.MAXIMIZE:
             loss = optimal_cost - sol_cost
-        return loss
+        return loss, sol
 
     @torch.no_grad()
-    def evaluate_regret(self, eval_loader, scaler=None):
+    def evaluate_regret(self, eval_loader, scaler=None, log_cases=False):
         self.forecast_model.eval()
         loss = 0
         rel_loss = 0
         trial = 0
+
+        # Initialize Logger
+        logger = None
+        if log_cases:
+            cases_dir = os.path.join(self.exp_dir, "cases_test")
+            os.makedirs(cases_dir, exist_ok=True)
+            # Use 'pno_cases.jsonl' to distinguish from mpc
+            logger = CaseLogger(os.path.join(cases_dir, "pno_cases.jsonl"))
+
+        count = 0
 
         for batch in eval_loader:
             batch = [tensor.to(self.device) for tensor in batch]
@@ -780,9 +811,23 @@ class PnOExperiment(Experiment):
             # Solve
             for j in range(batch_y_pred.shape[0]):
                 # accumulate loss
-                this_regret = self._cal_regret(self.allocate_model, batch_y_pred[j], batch_y[j])
+                this_regret, this_alloc = self._cal_regret(self.allocate_model, batch_y_pred[j], batch_y[j])
                 loss += this_regret
+
+                min_val = np.min(batch_y[j])
+                this_rel_regret = (this_regret / min_val) if min_val != 0 else 0
                 rel_loss += (this_regret / np.min(batch_y[j]))
+
+                if logger:
+                    count += 1
+                    logger.log({
+                        "case_id": count,
+                        "algo": "pno",
+                        "regret": float(this_regret),
+                        "rel_regret": float(this_rel_regret),
+                        "alloc": this_alloc.tolist() if isinstance(this_alloc, np.ndarray) else list(this_alloc),
+                        "true_prices": batch_y[j].tolist()
+                    })
 
             trial += batch_x.shape[0]
 
@@ -795,7 +840,7 @@ class PnOExperiment(Experiment):
         
     @torch.no_grad()
     def evaluate(self, eval_loader, scaler, criterion=None, load_best=False, save_result=False):
-        eval_regret = self.evaluate_regret(eval_loader, scaler)
+        eval_regret = self.evaluate_regret(eval_loader, scaler, log_cases=save_result)
         _, eval_metrics = self.evaluate_forecast(eval_loader, criterion, load_best)
         eval_metrics['Regret'] = eval_regret['abs_regret']
         eval_metrics['Rel Regret'] = eval_regret['rel_regret']
@@ -884,6 +929,284 @@ class PnOExperiment(Experiment):
     def _save_calib_scores(self, score, name):
         score_path = os.path.join(self.exp_dir, name)
         torch.save(score, score_path)
+
+
+==================================================
+FILE: ./core/src/allocate/experiment_mpc.py
+==================================================
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import gurobipy as gp
+from tqdm import tqdm
+
+import models
+from models.Allocate import AllocateModel
+from common.experiment import Experiment
+from allocate.data_provider import get_allocating_loader_and_dataset
+from utils.case_logger import CaseLogger
+
+class MPCExperiment(Experiment):
+    def __init__(self, configs):
+        super().__init__(configs)
+        self.prev_exp_dir = os.path.join('output', configs.prev_exp_id)
+        self._build_forecast_model()
+        self._load_constraint()
+        self._setup_gurobi_env()
+        self._build_allocate_model()
+
+        self.test_loader, self.test_set = get_allocating_loader_and_dataset(
+            self.configs, self.allocate_model, split='test', shuffle=False
+        )
+        self.scaler = self.test_set.scaler
+
+    def _build_forecast_model(self):
+        self.forecast_model = getattr(models, self.configs.model)(self.configs)
+        if self.configs.use_multi_gpu:
+            self.forecast_model = nn.DataParallel(self.forecast_model, device_ids=self.configs.gpus)
+        self.forecast_model.to(self.device)
+        model_path = os.path.join(self.prev_exp_dir, 'model.pt')
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Pre-trained model not found at {model_path}")
+        print(f"Loading pre-trained model from: {model_path}")
+        self.forecast_model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.forecast_model.eval()
+        self.model = self.forecast_model
+
+    def _load_constraint(self):
+        constraint_path = os.path.join(self.prev_exp_dir, 'constraint.pt')
+        if not os.path.exists(constraint_path):
+             constraint_path = os.path.join(self.prev_exp_dir, 'score.pt')
+        if not os.path.exists(constraint_path):
+             raise FileNotFoundError(f"Constraint file not found at {constraint_path}")
+        print(f"Loading constraints from: {constraint_path}")
+        self.constraint = torch.load(constraint_path, map_location='cpu')
+        if self.constraint.dim() == 1:
+             self.constraint = self.constraint.unsqueeze(0)
+        # Transpose check for safety (if saved as [H, 1])
+        if self.constraint.shape[0] != 1 and self.constraint.shape[1] == 1:
+             self.constraint = self.constraint.T
+
+    def _setup_gurobi_env(self):
+        # Global Gurobi settings for determinism
+        gp.setParam("OutputFlag", 0) # Suppress Gurobi log output
+        gp.setParam("Threads", 1)    # Use a single thread
+        gp.setParam("Method", 1)     # Dual Simplex (a deterministic method)
+        gp.setParam("Crossover", 0)
+        gp.setParam("Seed", getattr(self.configs, "random_seed", 42))
+    
+    def _build_allocate_model(self):
+        self.allocate_model = AllocateModel(
+            self.constraint.numpy(),
+            self.configs.uncertainty_quantile,
+            pred_len=self.configs.pred_len, # Max horizon
+            first_step_cap=getattr(self.configs, "mpc_first_step_cap", None),
+            quiet=True
+        )
+
+    def evaluate(self):
+        print(f"Starting MPC Evaluation on {len(self.test_loader)} batches...")
+        
+        total_regret = 0.0
+        total_rel_regret = 0.0
+        count = 0
+        #TODO: logger
+
+        # Setup Logger
+        cases_dir = os.path.join(self.exp_dir, "cases_test")
+        os.makedirs(cases_dir, exist_ok=True)
+        logger = CaseLogger(os.path.join(cases_dir, "mpc_cases.jsonl"))
+        
+        for batch in tqdm(self.test_loader):
+            # batch_x: Normalized history [B, Seq, 1]
+            # batch_y: Normalized future [B, Pred, 1]
+            batch_x, batch_y, _, _ = batch
+            
+            batch_x_np = batch_x.cpu().numpy()
+            batch_y_np = batch_y.cpu().numpy()
+            
+            # Unscale ground truth future prices once, as this is used in the simulation
+            batch_y_real = np.zeros_like(batch_y_np)
+            for i in range(len(batch_y_np)):
+                batch_y_real[i] = self.scaler.inverse_transform(batch_y_np[i].reshape(-1, 1)).flatten()
+
+            # Run simulation for each sample in batch
+            for i in range(len(batch_x_np)):
+                history = batch_x_np[i].flatten()
+                future = batch_y_real[i].flatten()
+                
+                # --- CORE CALL ---
+                cost, alloc = self._run_mpc_simulation(history, future)
+                # -----------------
+                
+                # Calculate metrics
+                optimal_cost = np.min(future) # Optimal buyer buys at the minimum future price
+                regret = cost - optimal_cost
+                rel_regret = regret / optimal_cost if optimal_cost != 0 else 0
+                
+                total_regret += regret
+                total_rel_regret += rel_regret
+                count += 1
+                
+                #TODO: logger
+                # Log
+                logger.log({
+                    "case_id": count,
+                    "algo": "mpc",
+                    "regret": regret,
+                    "rel_regret": rel_regret,
+                    "alloc": alloc,
+                    "true_prices": future.tolist()
+                })
+
+        avg_regret = total_regret / count
+        avg_rel_regret = total_rel_regret / count
+
+        # --- NEW: Construct standardized result.json ---
+        
+        # 1. Try to get MSE/MAE from the baseline (since model is identical)
+        base_metrics = {}
+        try:
+            base_res_path = os.path.join(self.prev_exp_dir, 'result.json')
+            if os.path.exists(base_res_path):
+                with open(base_res_path, 'r') as f:
+                    base_metrics = json.load(f)
+        except Exception:
+            pass
+
+        # 2. Construct final dictionary
+        final_metrics = {
+            'MSE': base_metrics.get('MSE', -1.0),       # Copy from baseline
+            'MAE': base_metrics.get('MAE', -1.0),       # Copy from baseline
+            'Regret': avg_regret,                       # Our new MPC result
+            'Rel Regret': avg_rel_regret                # Our new MPC result
+        }
+
+        print(f"Final MPC Results: {final_metrics}")
+        
+        # 3. Save as standard 'result.json'
+        res_path = os.path.join(self.exp_dir, 'result.json')
+        with open(res_path, 'w') as f:
+            json.dump(final_metrics, f, indent=4)
+            
+        return avg_regret
+
+    def _run_mpc_simulation(self, history_scaled, future_unscaled):
+        H = self.configs.pred_len # Should be 88
+        
+        # State variables
+        # current_history is unscaled (real prices)
+        current_history_unscaled = list(self.scaler.inverse_transform(history_scaled.reshape(-1, 1)).flatten())
+        budget_remaining = 1.0
+        cost_incurred = 0.0
+        actions_taken = []
+        
+        # Loop through each step in the prediction horizon
+        for t in range(H):
+            # 1. Prepare history for forecasting
+            # Use the last 'seq_len' real prices (the sliding window)
+            hist_unscaled = np.array(current_history_unscaled[-self.configs.seq_len:]).reshape(-1, 1)
+            hist_norm = self.scaler.transform(hist_unscaled)
+            hist_tensor = torch.tensor(hist_norm, dtype=torch.float32).unsqueeze(0).to(self.device)
+            
+            # 2. Forecast
+            with torch.no_grad():
+                pred_norm = self.forecast_model(hist_tensor) # [1, H, 1]
+            
+            # Inverse transform the forecast to get real price predictions
+            pred_norm_np = pred_norm.cpu().numpy().flatten()
+            pred_real = self.scaler.inverse_transform(pred_norm_np.reshape(-1, 1)).flatten()
+            
+            # 3. Optimization (The MPC Step)
+            
+            # A. Determine remaining horizon and constraint
+            remaining_steps = H - t
+            
+            if t == H - 1:
+                # If it's the last step, we must spend everything
+                amount_to_spend_fraction = budget_remaining
+                
+            else:
+                # B. Get the relevant constraint vector for the remaining steps
+                current_constraint = self.constraint[:, :remaining_steps].numpy()
+                
+                # C. Initialize "raw_action_fraction" variable
+                raw_action_fraction = 0.0
+                
+                # D. Try to solve WITH the cap first
+                try:
+                    solver = AllocateModel(
+                        current_constraint,
+                        self.configs.uncertainty_quantile,
+                        pred_len=remaining_steps,
+                        first_step_cap=getattr(self.configs, "mpc_first_step_cap", None),
+                        quiet=True
+                    )
+                    solver.setObj(pred_real[:remaining_steps])
+                    sol, _ = solver.solve()
+                    raw_action_fraction = float(sol[0])
+                    
+                except Exception:
+                    # E. First Failure: Try RELAXED (Ignore Cap)
+                    try:
+                        solver_relaxed = AllocateModel(
+                            current_constraint,
+                            self.configs.uncertainty_quantile,
+                            pred_len=remaining_steps,
+                            first_step_cap=None, # Ignore Cap
+                            quiet=True
+                        )
+                        solver_relaxed.setObj(pred_real[:remaining_steps])
+                        sol, _ = solver_relaxed.solve()
+                        raw_action_fraction = float(sol[0])
+                        
+                    except Exception:
+                        # F. Ultimate Failure: Default to HOLD (0.0)
+                        # If Gurobi fails entirely, we play it safe and spend nothing.
+                        # We print a warning so you know it happened, but we keep running.
+                        # print(f"Warning: Solver failed at step {t}/{H}. Holding.")
+                        raw_action_fraction = 0.0
+                
+                # G. Cap the raw action by the remaining budget
+                amount_to_spend_fraction = min(raw_action_fraction, budget_remaining)
+                
+            # 4. Execute (Trade)
+            
+            # Get the true price for the current step t
+            true_price = future_unscaled[t]
+            
+            # The actual execution cost is the *fraction of remaining budget* times the true price
+            cost_incurred += amount_to_spend_fraction * true_price
+            budget_remaining -= amount_to_spend_fraction
+            actions_taken.append(amount_to_spend_fraction)
+            
+            # 5. Update History (Slide window for the next step)
+            current_history_unscaled.append(true_price)
+            
+        return cost_incurred, actions_taken
+
+        
+
+
+==================================================
+FILE: ./core/src/utils/case_logger.py
+==================================================
+import json
+import os
+
+class CaseLogger:
+    def __init__(self, filepath):
+        self.filepath = filepath
+        # Clear file if it exists so we don't append to old logs
+        if os.path.exists(self.filepath):
+            os.remove(self.filepath)
+
+    def log(self, data_dict):
+        """Appends a dictionary as a JSON line to the log file."""
+        with open(self.filepath, "a") as f:
+            f.write(json.dumps(data_dict) + "\n")
 
 
 ==================================================
@@ -2523,12 +2846,35 @@ from gurobipy import GRB
 from pyepo.model.grb import optGrbModel
 
 class AllocateModel(optGrbModel):
-    def __init__(self, uncertainty, uncertainty_quantile=0.5):
+    def __init__(
+        self, 
+        uncertainty, 
+        uncertainty_quantile=0.5, 
+        pred_len=None, 
+        first_step_cap=None,
+        seed=42,
+        threads=1,
+        method=1,
+        crossover=0,
+        quiet=False
+        ):
         self.uncertainty = np.array(uncertainty)
         self.uncertainty_quantile = uncertainty_quantile
         self.uncertainty_bar = np.quantile(self.uncertainty, self.uncertainty_quantile)
         # print(self.uncertainty_bar)
-        self.pred_len = len(self.uncertainty[0])
+        if pred_len is not None:
+            self.pred_len = int(pred_len)
+        else:
+            self.pred_len = len(self.uncertainty[0])
+
+        self.first_step_cap = None
+        if first_step_cap is not None:
+            self.first_step_cap = float(max(0.0, min(1.0, first_step_cap)))
+        self.seed = seed
+        self.threads = threads
+        self.method = method
+        self.crossover = crossover
+        self.quiet = quiet
         super().__init__()
 
     def update_uncertainty(self, uncertainty):
@@ -2539,6 +2885,12 @@ class AllocateModel(optGrbModel):
     def _getModel(self): 
         # create a model
         optmodel = gp.Model()
+
+        optmodel.Params.OutputFlag = 0 if self.quiet else 1
+        optmodel.Params.Threads = self.threads
+        optmodel.Params.Seed = self.seed
+        optmodel.Params.Method = self.method
+        optmodel.Params.Crossover = self.crossover
         # variables
         action = optmodel.addVars(self.pred_len, name="action", vtype=GRB.CONTINUOUS)
         # model sense
@@ -2546,7 +2898,31 @@ class AllocateModel(optGrbModel):
         # constraints
         optmodel.addConstr(gp.quicksum(self.uncertainty[0,i] * action[i] for i in range(self.pred_len)) <= self.uncertainty_bar)
         optmodel.addConstr(gp.quicksum(action[i] for i in range(self.pred_len)) == 1)
+        if self.first_step_cap is not None and self.pred_len > 1:
+            optmodel.addConstr(
+                action[0] <= self.first_step_cap, 
+                name="first_step_safety_cap"
+            )
+        # This handles cases where uncertainty vector might be larger than current pred_len
+        # (Though with our slicing logic later, this is mostly a fallback)
+        total_uncertainty_len = len(self.uncertainty[0])
+        if self.pred_len < total_uncertainty_len:
+             for i in range(self.pred_len, total_uncertainty_len):
+                 optmodel.addConstr(action[i] == 0.0)
         return optmodel, action
+    
+    def solve(self):
+        """
+        Robust solve method that handles Infeasible models gracefully.
+        Overrides the parent class method to prevent crashes on high-volatility data.
+        """
+        try:
+            # Try the standard solver from the parent class (optGrbModel)
+            return super().solve()
+        except Exception:
+            # FALLBACK: If Infeasible (Gurobi crash), return 0.0 allocation.
+            # We return a list of zeros matching the prediction length.
+            return [0.0] * self.pred_len, 0.0
 
 class AllocateModelOld(optGrbModel):
     def __init__(self, uncertainty, uncertainty_bar):
@@ -3403,6 +3779,14 @@ import torch
 
 from allocate.experiment_pno import PnOExperiment
 
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+import torch
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True, warn_only=True)
+
 def run_experiment(configs):
     # Fix random seed to ensure reproducibility
     random.seed(configs.random_seed)
@@ -3432,9 +3816,9 @@ if __name__ == '__main__':
     # Remove the previous experiment with the same `exp_id`.
     exp_dir = os.path.join('output', configs['Experiment']['exp_id'])
     if os.path.exists(exp_dir):
-        print(f'Experiment {exp_dir} exists, delete and continue? [Y/N]', end=' ')
+        # print(f'Experiment {exp_dir} exists, delete and continue? [Y/N]', end=' ')
 
-        response = input()
+        response = 'Y'
         while response not in ['Y', 'N']:
             print('Invalid choice. Choose between [Y/N]', end=' ')
             response = input()
@@ -3538,6 +3922,101 @@ class EarlyStopping:
             print(f'Validation loss didn\'t decrease ({self.counter} out of {self.patience})')
             if self.counter >= self.patience:
                 self.early_stop = True
+
+
+
+==================================================
+FILE: ./core/src/run_mpc.py
+==================================================
+import os
+import random
+from argparse import Namespace, ArgumentParser
+import yaml
+import numpy as np
+import torch
+
+# 1. Enforce Determinism
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True, warn_only=True)
+
+# 2. Import your new Experiment
+from allocate.experiment_mpc import MPCExperiment
+
+if __name__ == '__main__':
+    parser = ArgumentParser()
+    parser.add_argument('--config', type=str, required=True)
+    args = parser.parse_args()
+
+    with open(args.config, 'r') as fin:
+        configs = yaml.safe_load(fin)
+
+    # Create output directory based on exp_id
+    exp_dir = os.path.join('output', configs['Experiment']['exp_id'])
+    os.makedirs(exp_dir, exist_ok=True)
+
+    # Flatten config dictionary into a Namespace object
+    configs = Namespace(**{
+        arg: val
+        for _, args in configs.items()
+        for arg, val in args.items()
+    })
+    
+    # 3. Run the MPC Experiment
+    exp = MPCExperiment(configs)
+    exp.evaluate()
+
+
+==================================================
+FILE: ./core/summary_usdcny_graph.png
+==================================================
+(Binary file excluded)
+
+
+
+==================================================
+FILE: ./core/summary_coinbase_graph.png
+==================================================
+(Binary file excluded)
+
+
+
+==================================================
+FILE: ./core/summary_audusd_graph.png
+==================================================
+(Binary file excluded)
+
+
+
+==================================================
+FILE: ./core/summary_sp500.txt
+==================================================
+Cap_Size | Abs_Regret | Rel_Regret | MSE | MAE
+---------------------------------------------------------
+0.1      | 165.61497159878883 | 0.05043648435236931 | 0.5567296743392944 | 0.6194135546684265
+0.25     | 165.61497159878883 | 0.05043648435236931 | 0.5567296743392944 | 0.6194135546684265
+0.5      | 165.61497159878883 | 0.05043648435236931 | 0.5567296743392944 | 0.6194135546684265
+0.75     | 165.61497159878883 | 0.05043648435236931 | 0.5567296743392944 | 0.6194135546684265
+1.0      | 165.61497159878883 | 0.05043648435236931 | 0.5567296743392944 | 0.6194135546684265
+
+
+
+==================================================
+FILE: ./core/summary_coinbase.txt
+==================================================
+Cap_Size | Abs_Regret | Rel_Regret | MSE | MAE
+---------------------------------------------------------
+0.1      | 2427.0538689813084 | 0.05057405493699884 | 0.09530776739120483 | 0.23162753880023956
+0.2      | 2399.96247989242 | 0.049881482899309756 | 0.09530776739120483 | 0.23162753880023956
+0.25     | 2399.6679819564724 | 0.04982880361112196 | 0.09530776739120483 | 0.23162753880023956
+0.3      | 2398.2466048627216 | 0.049781063711841635 | 0.09530776739120483 | 0.23162753880023956
+0.4      | 2397.025069708653 | 0.04974398841028049 | 0.09530776739120483 | 0.23162753880023956
+0.5      | 2396.9096163873137 | 0.049740169850563946 | 0.09530776739120483 | 0.23162753880023956
+0.6      | 2396.9096163873137 | 0.049740169850563946 | 0.09530776739120483 | 0.23162753880023956
+0.75     | 2396.9096163873137 | 0.049740169850563946 | 0.09530776739120483 | 0.23162753880023956
 
 
 
@@ -4264,7 +4743,7 @@ Experiment:
     exp_id: PatchTST/nzdusd_pno
 Hardware:
     random_seed: 2021
-    num_workers: 2
+    num_workers: 1
     gpu: 0
     use_multi_gpu: false
     gpus: null
@@ -4479,7 +4958,7 @@ Experiment:
     exp_id: PatchTST/sp500_pno
 Hardware:
     random_seed: 2021
-    num_workers: 2
+    num_workers: 1
     gpu: 0
     use_multi_gpu: false
     gpus: null
@@ -4685,6 +5164,65 @@ Conformal:
 Heuristic:
     topk: 5
     risk: false
+
+
+==================================================
+FILE: ./core/configs/PatchTST/usdjpy/temp_mpc_0.25.yaml
+==================================================
+Experiment:
+  exp_id: PatchTST/usdjpy_mpc_0.25cap
+  prev_exp_id: PatchTST/usdjpy_pno
+  mpc_first_step_cap: 0.25
+Hardware:
+  random_seed: 2021
+  num_workers: 0
+  gpu: 0
+  use_multi_gpu: false
+  gpus: null
+Dataset:
+  root_path: ../dataset
+  data_path: exchange_rate_600s.csv
+  task_type: U
+  univariate: usdjpy
+  date_col: transact_time
+  n_vars: 1
+  seq_len: 440
+  label_len: 0
+  pred_len: 88
+  interval: 1
+  standardize: true
+  enc_freq: null
+Model:
+  model: PatchTST
+  decomp: false
+  decomp_ksize: null
+  revin: true
+  revin_affine: false
+  revin_subtract_last: false
+  patch_len: 12
+  patch_stride: 6
+  patch_padding: end
+  pos_enc: learned
+  e_layers: 3
+  d_model: 16
+  n_heads: 4
+  d_ff: 128
+  activation: gelu
+  dropout: 0.3
+  shared_proj: true
+Allocate:
+  criterion: SPO+
+  criterion_weight: 1
+  train_epochs: 100
+  uncertainty_quantile: 0.3
+  patience: 3
+  batch_size: 32
+  lr: 0.0001
+  lr_scheduler: fixed
+  load_prev_weights: false
+Conformal:
+  error_rate: 0.05
+
 
 
 ==================================================
@@ -4911,13 +5449,131 @@ Heuristic:
 
 
 ==================================================
+FILE: ./core/configs/PatchTST/usdjpy/temp_mpc_0.3.yaml
+==================================================
+Experiment:
+  exp_id: PatchTST/usdjpy_mpc_0.3cap
+  prev_exp_id: PatchTST/usdjpy_pno
+  mpc_first_step_cap: 0.3
+Hardware:
+  random_seed: 2021
+  num_workers: 0
+  gpu: 0
+  use_multi_gpu: false
+  gpus: null
+Dataset:
+  root_path: ../dataset
+  data_path: exchange_rate_600s.csv
+  task_type: U
+  univariate: usdjpy
+  date_col: transact_time
+  n_vars: 1
+  seq_len: 440
+  label_len: 0
+  pred_len: 88
+  interval: 1
+  standardize: true
+  enc_freq: null
+Model:
+  model: PatchTST
+  decomp: false
+  decomp_ksize: null
+  revin: true
+  revin_affine: false
+  revin_subtract_last: false
+  patch_len: 12
+  patch_stride: 6
+  patch_padding: end
+  pos_enc: learned
+  e_layers: 3
+  d_model: 16
+  n_heads: 4
+  d_ff: 128
+  activation: gelu
+  dropout: 0.3
+  shared_proj: true
+Allocate:
+  criterion: SPO+
+  criterion_weight: 1
+  train_epochs: 100
+  uncertainty_quantile: 0.3
+  patience: 3
+  batch_size: 32
+  lr: 0.0001
+  lr_scheduler: fixed
+  load_prev_weights: false
+Conformal:
+  error_rate: 0.05
+
+
+
+==================================================
+FILE: ./core/configs/PatchTST/usdcny/temp_mpc_1.0.yaml
+==================================================
+Experiment:
+  exp_id: PatchTST/usdcny_mpc_1.0cap
+  prev_exp_id: PatchTST/usdcny_pno
+  mpc_first_step_cap: 1.0
+Hardware:
+  random_seed: 2021
+  num_workers: 0
+  gpu: 0
+  use_multi_gpu: false
+  gpus: null
+Dataset:
+  root_path: ../dataset
+  data_path: exchange_rate_600s.csv
+  task_type: U
+  univariate: usdcny
+  date_col: transact_time
+  n_vars: 1
+  seq_len: 440
+  label_len: 0
+  pred_len: 88
+  interval: 1
+  standardize: true
+  enc_freq: null
+Model:
+  model: PatchTST
+  decomp: false
+  decomp_ksize: null
+  revin: true
+  revin_affine: false
+  revin_subtract_last: false
+  patch_len: 12
+  patch_stride: 6
+  patch_padding: end
+  pos_enc: learned
+  e_layers: 3
+  d_model: 16
+  n_heads: 4
+  d_ff: 128
+  activation: gelu
+  dropout: 0.3
+  shared_proj: true
+Allocate:
+  criterion: MSE+SPO+
+  criterion_weight: 1
+  train_epochs: 100
+  uncertainty_quantile: 0.3
+  patience: 3
+  batch_size: 32
+  lr: 0.001
+  lr_scheduler: fixed
+  load_prev_weights: false
+Conformal:
+  error_rate: 0.05
+
+
+
+==================================================
 FILE: ./core/configs/PatchTST/usdcny/pno.yaml
 ==================================================
 Experiment:
     exp_id: PatchTST/usdcny_pno
 Hardware:
     random_seed: 2021
-    num_workers: 2
+    num_workers: 1
     gpu: 0
     use_multi_gpu: false
     gpus: null
@@ -5021,6 +5677,62 @@ Allocate:
     load_prev_weights: false
 Conformal:
     error_rate: 0.05
+
+
+==================================================
+FILE: ./core/configs/PatchTST/usdcny/mpc.yaml
+==================================================
+Experiment:
+    exp_id: PatchTST/usdcny_mpc
+    # This MUST match the folder name of your baseline run
+    prev_exp_id: PatchTST/usdcny_pno
+    # The constraint: "Spend at most 25% of remaining budget per step"
+    mpc_first_step_cap: 0.25  
+
+Hardware:
+    random_seed: 2021
+    num_workers: 1       
+    gpu: 0
+    use_multi_gpu: false
+    gpus: null
+
+Dataset:
+    root_path: ../dataset
+    data_path: exchange_rate_600s.csv
+    task_type: U
+    univariate: usdcny
+    date_col: transact_time
+    n_vars: 1
+    seq_len: 440
+    label_len: 0
+    pred_len: 88
+    interval: 1
+    standardize: true
+    enc_freq: null
+
+Model:
+    model: PatchTST
+    decomp: false
+    decomp_ksize: null
+    revin: true
+    revin_affine: false
+    revin_subtract_last: false
+    patch_len: 12
+    patch_stride: 6
+    patch_padding: end
+    pos_enc: learned
+    e_layers: 3
+    d_model: 16
+    n_heads: 4
+    d_ff: 128
+    activation: gelu
+    dropout: 0.3
+    shared_proj: true
+
+Allocate:
+    # Must match the quantile used in PnO baseline
+    uncertainty_quantile: 0.3
+    batch_size: 32
 
 
 ==================================================
@@ -5183,6 +5895,65 @@ Allocate:
 
 
 ==================================================
+FILE: ./core/configs/PatchTST/coinbase/temp_mpc_0.7.yaml
+==================================================
+Experiment:
+  exp_id: PatchTST/coinbase_mpc_0.7cap
+  prev_exp_id: PatchTST/coinbase_pno
+  mpc_first_step_cap: 0.7
+Hardware:
+  random_seed: 2021
+  num_workers: 0
+  gpu: 0
+  use_multi_gpu: false
+  gpus: null
+Dataset:
+  root_path: ../dataset
+  data_path: coinbase_1hour.csv
+  task_type: U
+  univariate: Open
+  date_col: Date
+  n_vars: 1
+  seq_len: 720
+  label_len: 0
+  pred_len: 144
+  interval: 1
+  standardize: true
+  enc_freq: null
+Model:
+  model: PatchTST
+  decomp: false
+  decomp_ksize: null
+  revin: true
+  revin_affine: false
+  revin_subtract_last: false
+  patch_len: 12
+  patch_stride: 6
+  patch_padding: end
+  pos_enc: learned
+  e_layers: 3
+  d_model: 16
+  n_heads: 4
+  d_ff: 128
+  activation: gelu
+  dropout: 0.3
+  shared_proj: true
+Allocate:
+  criterion: SPO+
+  criterion_weight: 1
+  train_epochs: 100
+  uncertainty_quantile: 0.3
+  patience: 3
+  batch_size: 32
+  lr: 0.0001
+  lr_scheduler: fixed
+  load_prev_weights: false
+Conformal:
+  error_rate: 0.05
+
+
+
+==================================================
 FILE: ./core/configs/PatchTST/coinbase/predict.yaml
 ==================================================
 Experiment:
@@ -5242,7 +6013,7 @@ Experiment:
     exp_id: PatchTST/coinbase_pno
 Hardware:
     random_seed: 2021
-    num_workers: 4
+    num_workers: 1
     gpu: 0
     use_multi_gpu: false
     gpus: null
@@ -5459,13 +6230,72 @@ Heuristic:
 
 
 ==================================================
+FILE: ./core/configs/PatchTST/eth/temp_mpc_0.6.yaml
+==================================================
+Experiment:
+  exp_id: PatchTST/eth_mpc_0.6cap
+  prev_exp_id: PatchTST/eth_pno
+  mpc_first_step_cap: 0.6
+Hardware:
+  random_seed: 2021
+  num_workers: 0
+  gpu: 0
+  use_multi_gpu: false
+  gpus: null
+Dataset:
+  root_path: ../dataset
+  data_path: ETH_1hour.csv
+  task_type: U
+  univariate: Open
+  date_col: Date
+  n_vars: 1
+  seq_len: 720
+  label_len: 0
+  pred_len: 144
+  interval: 1
+  standardize: true
+  enc_freq: null
+Model:
+  model: PatchTST
+  decomp: false
+  decomp_ksize: null
+  revin: true
+  revin_affine: false
+  revin_subtract_last: false
+  patch_len: 12
+  patch_stride: 6
+  patch_padding: end
+  pos_enc: learned
+  e_layers: 3
+  d_model: 16
+  n_heads: 4
+  d_ff: 128
+  activation: gelu
+  dropout: 0.3
+  shared_proj: true
+Allocate:
+  criterion: SPO+
+  criterion_weight: 1
+  train_epochs: 100
+  uncertainty_quantile: 0.3
+  patience: 3
+  batch_size: 32
+  lr: 0.0003
+  lr_scheduler: fixed
+  load_prev_weights: false
+Conformal:
+  error_rate: 0.05
+
+
+
+==================================================
 FILE: ./core/configs/PatchTST/eth/pno.yaml
 ==================================================
 Experiment:
     exp_id: PatchTST/eth_pno
 Hardware:
     random_seed: 2021
-    num_workers: 2
+    num_workers: 1
     gpu: 0
     use_multi_gpu: false
     gpus: null
@@ -5681,7 +6511,7 @@ Experiment:
     exp_id: PatchTST/audusd_pno
 Hardware:
     random_seed: 2021
-    num_workers: 2
+    num_workers: 1
     gpu: 0
     use_multi_gpu: false
     gpus: null
@@ -5728,6 +6558,59 @@ Allocate:
     load_prev_weights: false
 Conformal:
     error_rate: 0.05
+
+
+==================================================
+FILE: ./core/configs/PatchTST/audusd/test_debug.yaml
+==================================================
+Experiment:
+  exp_id: PatchTST/audusd_mpc_debug
+  prev_exp_id: PatchTST/audusd_pno  # The PnO model you just trained
+  mpc_first_step_cap: 0.1
+
+Hardware:
+  random_seed: 2021
+  num_workers: 0       # Critical for stability
+  gpu: 0
+  use_multi_gpu: false
+  gpus: null
+
+Dataset:
+  root_path: ../dataset
+  data_path: exchange_rate_600s.csv  # Standard for this dataset
+  task_type: U
+  univariate: audusd                 # Standard for this dataset
+  date_col: transact_time
+  n_vars: 1
+  seq_len: 440
+  label_len: 0
+  pred_len: 88
+  interval: 1
+  standardize: true
+  enc_freq: null
+
+Model:
+  model: PatchTST
+  decomp: false
+  decomp_ksize: null
+  revin: true
+  revin_affine: false
+  revin_subtract_last: false
+  patch_len: 12
+  patch_stride: 6
+  patch_padding: end
+  pos_enc: learned
+  e_layers: 3
+  d_model: 16
+  n_heads: 4
+  d_ff: 128
+  activation: gelu
+  dropout: 0.3
+  shared_proj: true
+
+Allocate:
+  uncertainty_quantile: 0.3
+  batch_size: 32   # Critical fix
 
 
 ==================================================
@@ -5835,7 +6718,7 @@ Experiment:
     exp_id: PatchTST/djia_pno
 Hardware:
     random_seed: 2021
-    num_workers: 2
+    num_workers: 1
     gpu: 0
     use_multi_gpu: false
     gpus: null
@@ -6393,6 +7276,247 @@ Allocate:
 
 
 ==================================================
+FILE: ./core/summary_djia.txt
+==================================================
+Cap_Size | Abs_Regret | Rel_Regret | MSE | MAE
+---------------------------------------------------------
+0.1      | 1309.063572485207 | 0.04849249436157036 | 0.3551647961139679 | 0.48154720664024353
+0.25     | 1309.063572485207 | 0.04849249436157036 | 0.3551647961139679 | 0.48154720664024353
+0.5      | 1309.063572485207 | 0.04849249436157036 | 0.3551647961139679 | 0.48154720664024353
+0.75     | 1309.063572485207 | 0.04849249436157036 | 0.3551647961139679 | 0.48154720664024353
+1.0      | 1309.063572485207 | 0.04849249436157036 | 0.3551647961139679 | 0.48154720664024353
+
+
+
+==================================================
+FILE: ./core/summary_usdjpy.txt
+==================================================
+Cap_Size | Abs_Regret | Rel_Regret | MSE | MAE
+---------------------------------------------------------
+0.1      | 0.005858537466114381 | 0.0037506117106857776 | 0.12003812938928604 | 0.27955660223960876
+0.2      | 0.005858537466114381 | 0.0037506117106857776 | 0.12003812938928604 | 0.27955660223960876
+
+
+
+==================================================
+FILE: ./core/summary_usdcny.txt
+==================================================
+Cap_Size | Abs_Regret | Rel_Regret | MSE | MAE
+---------------------------------------------------------
+0.1      | 0.0034386831617327076 | 0.0004754966945323532 | 0.0060256170108914375 | 0.05091505125164986
+0.25     | 0.003285269277900379 | 0.0004543204776192754 | 0.0060256170108914375 | 0.05091505125164986
+0.5      | 0.003219990084704034 | 0.0004452927674313593 | 0.0060256170108914375 | 0.05091505125164986
+0.75     | 0.003243180249916217 | 0.00044850787918513144 | 0.0060256170108914375 | 0.05091505125164986
+
+
+
+==================================================
+FILE: ./core/graph.py
+==================================================
+import matplotlib
+matplotlib.use('Agg')  # Use a non-interactive backend for saving only
+import matplotlib.pyplot as plt
+import pandas as pd
+import sys
+import os
+
+def process_and_save_graph(file_path):
+    # 1. Check if file exists
+    if not os.path.exists(file_path):
+        print(f"Error: The file '{file_path}' does not exist.")
+        return
+
+    # 2. Load the data
+    try:
+        # sep='|' handles the pipe separators
+        # skiprows=[1] ignores the '-------' line
+        # skipinitialspace=True handles whitespace around data
+        df = pd.read_csv(file_path, sep='|', skiprows=[1], skipinitialspace=True)
+        
+        # Clean whitespace from column names and string data
+        df.columns = [c.strip() for c in df.columns]
+        
+        # Sort by Cap_Size to ensure the lines connect correctly
+        df = df.sort_values(by='Cap_Size').reset_index(drop=True)
+        
+    except Exception as e:
+        print(f"Error parsing the file: {e}")
+        return
+
+    # 3. Setup the visualization
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Analysis for: {os.path.basename(file_path)}', fontsize=16, fontweight='bold')
+
+    metrics = ['Abs_Regret', 'Rel_Regret', 'MSE', 'MAE']
+    colors = ['#1f77b4', '#2ca02c', '#d62728', '#9467bd']
+    markers = ['o', 's', '^', 'd']
+
+    for i, ax in enumerate(axes.flat):
+        metric = metrics[i]
+        ax.plot(df['Cap_Size'], df[metric], marker=markers[i], color=colors[i], 
+                linestyle='-', linewidth=2, markersize=8)
+        ax.set_title(f'{metric} vs Cap_Size', fontsize=12, pad=10)
+        ax.set_xlabel('Cap_Size')
+        ax.set_ylabel('Value')
+        ax.grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # 4. Generate the output filename
+    # os.path.splitext splits "data.txt" into ("data", ".txt")
+    base_name, _ = os.path.splitext(file_path)
+    output_filename = f"{base_name}_graph.png"
+
+    # 5. Save and Close
+    plt.savefig(output_filename, dpi=300) # dpi=300 for high quality
+    plt.close(fig) 
+    print(f"Successfully saved graph to: {output_filename}")
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        process_and_save_graph(sys.argv[1])
+    else:
+        path = input("Please enter the path to your .txt file: ")
+        process_and_save_graph(path)
+
+
+==================================================
+FILE: ./core/run_sensitivity.sh
+==================================================
+#!/bin/bash
+
+# ==============================================================================
+# FAST SENSITIVITY ANALYSIS (MPC ONLY)
+# ==============================================================================
+
+# 1. Define Datasets (Excluding usdcny as you already have it)
+DATASETS=("usdcny")
+
+# 2. Define Budget Caps to test
+CAPS=(0.1 0.25 0.5 0.75 1.0)
+
+PYTHON_EXEC="python"
+
+# Helper to generate config
+generate_yaml() {
+    local dataset=$1
+    local cap=$2
+    local output_file=$3
+    
+    $PYTHON_EXEC -c "
+import yaml
+import os
+
+pno_config_path = 'configs/PatchTST/${dataset}/pno.yaml'
+with open(pno_config_path, 'r') as f:
+    config = yaml.safe_load(f)
+
+# Modify for MPC
+config['Experiment']['exp_id'] = f'PatchTST/${dataset}_mpc_${cap}cap'
+config['Experiment']['prev_exp_id'] = f'PatchTST/${dataset}_pno'
+config['Experiment']['mpc_first_step_cap'] = float(${cap})
+
+# Ensure critical hardware/allocation settings
+if 'Hardware' not in config: config['Hardware'] = {}
+config['Hardware']['num_workers'] = 0 
+if 'Allocate' not in config: config['Allocate'] = {}
+config['Allocate']['batch_size'] = 32
+config['Allocate']['uncertainty_quantile'] = 0.3 
+
+with open('${output_file}', 'w') as f:
+    yaml.dump(config, f, sort_keys=False)
+"
+}
+
+# Helper to extract metrics
+extract_metric() {
+    local json_file=$1
+    local key=$2
+    if [ -f "$json_file" ]; then
+        $PYTHON_EXEC -c "import json; print(json.load(open('$json_file'))['$key'])" 2>/dev/null
+    else
+        echo "N/A"
+    fi
+}
+
+# ==============================================================================
+# MAIN LOOP
+# ==============================================================================
+
+for DATASET in "${DATASETS[@]}"; do
+    echo "=================================================================="
+    echo "PROCESSING DATASET: $DATASET"
+    echo "=================================================================="
+    
+    SUMMARY_FILE="summary_${DATASET}.txt"
+    # Create header if file doesn't exist
+    if [ ! -f "$SUMMARY_FILE" ]; then
+        echo "Cap_Size | Abs_Regret | Rel_Regret | MSE | MAE" > "$SUMMARY_FILE"
+        echo "---------------------------------------------------------" >> "$SUMMARY_FILE"
+    fi
+
+    # Check if PnO model exists (Safety Check)
+    PNO_MODEL="output/PatchTST/${DATASET}_pno/model.pt"
+    if [ ! -f "$PNO_MODEL" ]; then
+        echo "[ERROR] PnO model not found for $DATASET! Skipping..."
+        continue
+    fi
+
+    # Run MPC Loops
+    for CAP in "${CAPS[@]}"; do
+        echo "  > Running MPC with Cap: $CAP"
+        
+        TEMP_CONFIG="configs/PatchTST/${DATASET}/temp_mpc_${CAP}.yaml"
+        generate_yaml "$DATASET" "$CAP" "$TEMP_CONFIG"
+        
+        # Run MPC
+        $PYTHON_EXEC src/run_mpc.py --config "$TEMP_CONFIG"
+        
+        # Collect Results
+        RESULT_JSON="output/PatchTST/${DATASET}_mpc_${CAP}cap/result.json"
+        
+        if [ -f "$RESULT_JSON" ]; then
+            REGRET=$(extract_metric "$RESULT_JSON" "Regret")
+            REL_REG=$(extract_metric "$RESULT_JSON" "Rel Regret")
+            MSE=$(extract_metric "$RESULT_JSON" "MSE")
+            MAE=$(extract_metric "$RESULT_JSON" "MAE")
+            
+            # Format nicely
+            printf "%-8s | %-10s | %-10s | %-5s | %-5s\n" "$CAP" "$REGRET" "$REL_REG" "$MSE" "$MAE" >> "$SUMMARY_FILE"
+            echo "    [DONE] Regret: $REGRET"
+        else
+            echo "    [FAIL] No result.json found!"
+        fi
+        
+        rm "$TEMP_CONFIG"
+    done
+    
+    echo "Finished $DATASET. Results in $SUMMARY_FILE"
+    echo ""
+done
+
+
+==================================================
+FILE: ./core/summary_audusd.txt
+==================================================
+Cap_Size | Abs_Regret | Rel_Regret | MSE | MAE
+---------------------------------------------------------
+0.1      | 0.0022437337525979214 | 0.00339609549375925 | 0.03384649008512497 | 0.1410181224346161
+0.2      | 0.0022375894410122175 | 0.003387682718131191 | 0.03384649008512497 | 0.1410181224346161
+0.25     | 0.002253691147726974 | 0.0034123159123107425 | 0.03384649008512497 | 0.1410181224346161
+0.3      | 0.0022648473279608997 | 0.0034294765124302656 | 0.03384649008512497 | 0.1410181224346161
+0.4      | 0.0022631028323247503 | 0.003427131203016948 | 0.03384649008512497 | 0.1410181224346161
+0.5      | 0.002248510268477488 | 0.003405219249732793 | 0.03384649008512497 | 0.1410181224346161
+0.6      | 0.0022462118254154406 | 0.0034018689239465123 | 0.03384649008512497 | 0.1410181224346161
+0.75     | 0.002243775727072584 | 0.0033983439166763944 | 0.03384649008512497 | 0.1410181224346161
+0.7      | 0.002244724218902123 | 0.003399731146988619 | 0.03384649008512497 | 0.1410181224346161
+0.8      | 0.002242234484873769 | 0.0033960601257602275 | 0.03384649008512497 | 0.1410181224346161
+0.9      | 0.0022410114699778524 | 0.0033942573045762873 | 0.03384649008512497 | 0.1410181224346161
+1.0      | 0.00224049777866158 | 0.003393484699666944 | 0.03384649008512497 | 0.1410181224346161
+
+
+
+==================================================
 FILE: ./dump_project.sh
 ==================================================
 #!/usr/bin/env bash
@@ -6403,19 +7527,32 @@ OUTPUT_FILE="project_dump.txt"
 # Empty or create the output file
 : > "$OUTPUT_FILE"
 
-# Find all regular files, excluding .git and the output file itself
+# Find all regular files, excluding:
+# 1. .git directory
+# 2. core/output directory (too big)
+# 3. __pycache__ directories (unnecessary binaries)
+# 4. The output file itself
 find . \
   -path './.git' -prune -o \
+  -path './core/output' -prune -o \
+  -name '__pycache__' -prune -o \
   -type f ! -name "$OUTPUT_FILE" -print0 |
 while IFS= read -r -d '' file; do
   echo "==================================================" >> "$OUTPUT_FILE"
   echo "FILE: $file" >> "$OUTPUT_FILE"
   echo "==================================================" >> "$OUTPUT_FILE"
   
-  if [[ "$file" == ./dataset/* ]]; then
+  # Check for binary extensions (PNG, PYC, etc)
+  if [[ "$file" == *.png || "$file" == *.pyc || "$file" == *.jpg ]]; then
+    echo "(Binary file excluded)" >> "$OUTPUT_FILE"
+
+  # Check for dataset folder
+  elif [[ "$file" == ./dataset/* ]]; then
     echo "(Showing first 10 lines only – dataset truncated)" >> "$OUTPUT_FILE"
     echo "" >> "$OUTPUT_FILE"
     head -n 10 "$file" >> "$OUTPUT_FILE"
+
+  # Standard text files
   else
     cat "$file" >> "$OUTPUT_FILE"
   fi
@@ -6423,7 +7560,6 @@ while IFS= read -r -d '' file; do
   echo -e "\n\n" >> "$OUTPUT_FILE"
 done
 
-echo "Done. Written to \$OUTPUT_FILE"
-
+echo "Done. Written to $OUTPUT_FILE"
 
 
