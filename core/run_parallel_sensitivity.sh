@@ -1,22 +1,27 @@
 #!/bin/bash
 
 # ==============================================================================
-# PARALLEL SENSITIVITY ANALYSIS (Utilization: 100%)
+# BATCHED SENSITIVITY ANALYSIS (Safe for GPU & CPU)
 # ==============================================================================
 
 # 1. Define Datasets and Caps
-DATASETS=("coinbase" "usdcny")
-CAPS=(0.1 0.25 0.5 0.75 1.0)
+DATASETS=("audusd" "usdcny" "coinbase" "djia" "sp500" "usdjpy")
+CAPS=(0.1 0.2 0.25 0.3 0.4 0.5 0.6 0.7 0.75 0.8 0.9 1.0)
 PYTHON_EXEC="python"
 
-# Create logs directory to keep things clean
+# --- MAX PARALLEL JOBS ---
+# We limit to 10 concurrent experiments.
+# 10 Exps * 4 Internal Threads = 40 Threads (Fits on 48-core CPU)
+# 10 Models on GPU = ~10-15GB VRAM (Fits on 32GB GPU)
+MAX_JOBS=10
+
+# Create logs directory
 mkdir -p logs_sensitivity
 
 echo "=================================================================="
 echo "Phase 1: Generating Config Files"
 echo "=================================================================="
 
-# Python snippet to generate config
 generate_yaml() {
     local dataset=$1
     local cap=$2
@@ -26,7 +31,6 @@ generate_yaml() {
 import yaml
 import os
 
-# --- FIX: Define the output filename as a Python string first ---
 target_file = '${output_file}'
 pno_config_path = 'configs/PatchTST/${dataset}/pno.yaml'
 
@@ -34,22 +38,18 @@ try:
     with open(pno_config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    # Modify for MPC
     config['Experiment']['exp_id'] = f'PatchTST/${dataset}_mpc_${cap}cap'
     config['Experiment']['prev_exp_id'] = f'PatchTST/${dataset}_pno'
     config['Experiment']['mpc_first_step_cap'] = float(${cap})
 
-    # Optimization settings
     if 'Hardware' not in config: config['Hardware'] = {}
     config['Hardware']['num_workers'] = 0 
     if 'Allocate' not in config: config['Allocate'] = {}
     config['Allocate']['batch_size'] = 32
     config['Allocate']['uncertainty_quantile'] = 0.3 
 
-    # Write to the target file variable
     with open(target_file, 'w') as f:
         yaml.dump(config, f, sort_keys=False)
-        
     print(f'Generated: {target_file}')
 
 except FileNotFoundError:
@@ -59,7 +59,7 @@ except Exception as e:
 "
 }
 
-# Loop to generate ALL configs upfront
+# Generate all configs
 for DATASET in "${DATASETS[@]}"; do
     for CAP in "${CAPS[@]}"; do
         CONFIG_FILE="configs/PatchTST/${DATASET}/temp_mpc_${CAP}.yaml"
@@ -69,15 +69,16 @@ done
 
 echo ""
 echo "=================================================================="
-echo "Phase 2: Launching Experiments in Parallel"
+echo "Phase 2: Running Batched Experiments"
 echo "=================================================================="
 
-# Launch ALL experiments in the background
+counter=0
+
 for DATASET in "${DATASETS[@]}"; do
-    # Safety Check: PnO model must exist
+    # Check if PnO model exists
     PNO_MODEL="output/PatchTST/${DATASET}_pno/model.pt"
     if [ ! -f "$PNO_MODEL" ]; then
-        echo "[WARNING] PnO model not found for $DATASET! Skipping."
+        echo "[WARNING] PnO model not found for $DATASET! Skipping..."
         continue
     fi
 
@@ -86,31 +87,32 @@ for DATASET in "${DATASETS[@]}"; do
         LOG_FILE="logs_sensitivity/${DATASET}_mpc_${CAP}.log"
         
         if [ -f "$CONFIG_FILE" ]; then
-            echo " > Launching: $DATASET (Cap $CAP) -> Logs: $LOG_FILE"
-            # The '&' puts it in background immediately
+            echo " > Launching: $DATASET (Cap $CAP)"
+            
+            # Run in background
             nohup $PYTHON_EXEC src/run_mpc.py --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
-        else
-            echo " > [SKIPPING] Config missing: $CONFIG_FILE"
+            
+            # --- QUEUE LOGIC ---
+            ((counter++))
+            
+            # If we reached MAX_JOBS, wait for them to finish before starting new ones
+            if (( counter >= MAX_JOBS )); then
+                echo "   [Batch Limit Reached] Waiting for current batch of $MAX_JOBS jobs to finish..."
+                wait
+                echo "   [Resuming] Batch finished. Starting next batch..."
+                counter=0
+            fi
         fi
     done
 done
 
-echo ""
-echo "=================================================================="
-echo "Phase 3: Waiting for completion..."
-echo "=================================================================="
-echo "All jobs are running. Check 'htop' to see 100% CPU usage."
-echo "The script will pause here until ALL experiments are finished."
-
-# 'wait' pauses this script until all background jobs started by it are done
+# Wait for the final stragglers
 wait
 
 echo ""
 echo "=================================================================="
-echo "Phase 4: Cleanup"
+echo "Phase 3: Cleanup"
 echo "=================================================================="
-
-# Delete the temp configs
 rm configs/PatchTST/*/temp_mpc_*.yaml
 echo "Cleaned up temporary config files."
 echo "Done."

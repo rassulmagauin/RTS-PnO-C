@@ -153,6 +153,9 @@ class MPCExperiment(Experiment):
 
     def _run_mpc_simulation(self, history_norm_flat, future_real_flat):
         H = self.configs.pred_len
+
+        liquidation_window = max(5, int(H * 0.1)) 
+        liquidation_start_step = H - liquidation_window
         
         current_history_unscaled = list(self.scaler.inverse_transform(history_norm_flat.reshape(-1, 1)).flatten())
         budget_remaining = 1.0
@@ -177,6 +180,10 @@ class MPCExperiment(Experiment):
                 amount_to_spend_fraction = budget_remaining
             else:
                 current_constraint = self.constraint[:, :remaining_steps].numpy()
+
+                current_cap = getattr(self.configs, "mpc_first_step_cap", None)
+                if t >= liquidation_start_step:
+                    current_cap = None
                 raw_action_fraction = 0.0
                 
                 try:
@@ -184,7 +191,7 @@ class MPCExperiment(Experiment):
                         current_constraint,
                         self.configs.uncertainty_quantile,
                         pred_len=remaining_steps,
-                        first_step_cap=getattr(self.configs, "mpc_first_step_cap", None),
+                        first_step_cap=current_cap,
                         quiet=True
                     )
                     solver.setObj(pred_real[:remaining_steps])
@@ -204,7 +211,30 @@ class MPCExperiment(Experiment):
                         raw_action_fraction = float(sol[0])
                     except Exception:
                         raw_action_fraction = 0.0
-                
+                if t >= liquidation_start_step and raw_action_fraction < 1e-6:
+                    
+                    # 1. Look at the forecast for the remaining liquidation period
+                    future_preds = pred_real[:remaining_steps]
+                    
+                    # 2. Compare "Now" vs "Future Average"
+                    current_pred_price = future_preds[0]
+                    avg_future_price = np.mean(future_preds)
+                    
+                    # 3. Calculate Urgency
+                    # > 1.0 : Prices are rising. Buy MORE now.
+                    # < 1.0 : Prices are falling. Buy LESS now (wait).
+                    if current_pred_price > 1e-6: # Avoid division by zero
+                        urgency_factor = avg_future_price / current_pred_price
+                    else:
+                        urgency_factor = 1.0
+                        
+                    # 4. Clip the factor for safety 
+                    # We never want to stop completely (0.5x) or panic dump (2.0x)
+                    urgency_factor = np.clip(urgency_factor, 0.5, 2.0)
+                    
+                    # 5. Apply to the Base Pace (TWAP)
+                    base_pace = budget_remaining / remaining_steps
+                    raw_action_fraction = base_pace * urgency_factor
                 amount_to_spend_fraction = min(raw_action_fraction, budget_remaining)
             
             true_price = future_real_flat[t]
