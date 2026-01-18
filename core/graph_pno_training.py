@@ -8,7 +8,7 @@ import json
 # Configuration
 DATASETS = ["usdcny", "coinbase", "audusd", "djia", "sp500", "usdjpy"]
 # The caps you used in your training script
-CAPS = [0.1, 0.25, 0.5, 0.75, 1.0] 
+CAPS = [0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0] 
 OUTPUT_DIR = "graphs_pno_training"
 
 def get_metrics(path):
