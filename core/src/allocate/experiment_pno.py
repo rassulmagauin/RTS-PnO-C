@@ -178,7 +178,8 @@ class PnOExperiment(Experiment):
                         "regret": float(this_regret),
                         "rel_regret": float(this_rel_regret),
                         "alloc": this_alloc.tolist() if isinstance(this_alloc, np.ndarray) else list(this_alloc),
-                        "true_prices": batch_y[j].tolist()
+                        "true_prices": batch_y[j].tolist(),
+                        "pred_prices": batch_y_pred[j].tolist()
                     })
             trial += batch_x.shape[0]
 

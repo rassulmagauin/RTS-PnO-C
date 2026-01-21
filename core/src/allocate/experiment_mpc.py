@@ -104,7 +104,7 @@ class MPCExperiment(Experiment):
             )
             # --- PARALLEL LOOP END ---
 
-            for i, (cost, alloc) in enumerate(results):
+            for i, (cost, alloc, preds) in enumerate(results):
                 future = batch_y_real[i].flatten()
                 
                 optimal_cost = np.min(future)
@@ -121,7 +121,8 @@ class MPCExperiment(Experiment):
                     "regret": regret,
                     "rel_regret": rel_regret,
                     "alloc": alloc,
-                    "true_prices": future.tolist()
+                    "true_prices": future.tolist(),
+                    "pred_prices": preds
                 })
 
         avg_regret = total_regret / count
@@ -161,6 +162,8 @@ class MPCExperiment(Experiment):
         budget_remaining = 1.0
         cost_incurred = 0.0
         actions_taken = []
+
+        rolling_preds = []
         
         for t in range(H):
             hist_unscaled = np.array(current_history_unscaled[-self.configs.seq_len:]).reshape(-1, 1)
@@ -174,6 +177,8 @@ class MPCExperiment(Experiment):
             pred_norm_np = pred_norm.cpu().numpy().flatten()
             pred_real = self.scaler.inverse_transform(pred_norm_np.reshape(-1, 1)).flatten()
             
+            rolling_preds.append(float(pred_real[0]))
+
             remaining_steps = H - t
             
             if t == H - 1:
@@ -244,4 +249,4 @@ class MPCExperiment(Experiment):
             
             current_history_unscaled.append(true_price)
             
-        return cost_incurred, actions_taken
+        return cost_incurred, actions_taken, rolling_preds
