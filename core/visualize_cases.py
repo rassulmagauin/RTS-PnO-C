@@ -9,18 +9,26 @@ import json
 # ==========================================
 # CONFIGURATION
 # ==========================================
-DATASET = "usdcny"
-BEST_CAP = 0.75       # Your best continuous cap
-BASELINE_CAP = 1.0    # Static baseline
-OUTPUT_DIR = f"graphs_cases_representative/{DATASET}"
+# Map each dataset to its BEST performing Cap size
+# (Derived from your sensitivity analysis)
+DATASET_CONFIGS = {
+    "usdcny":   0.75,
+    "audusd":   0.25,
+    "usdjpy":   0.7,
+    "sp500":    0.9,
+    "coinbase": 0.75, # Best attempt (even if overall loss)
+    "djia":     0.7   # Best attempt
+}
+
+BASELINE_CAP = 1.0 
+OUTPUT_BASE_DIR = "graphs_detailed_cases"
 
 # ==========================================
-# HELPERS
+# HELPER FUNCTIONS
 # ==========================================
 def load_json_lines(path):
     data = []
     if not os.path.exists(path):
-        print(f"[Error] Missing: {path}")
         return None
     with open(path, 'r') as f:
         for line in f:
@@ -28,115 +36,175 @@ def load_json_lines(path):
             except: continue
     return pd.DataFrame(data)
 
-def plot_combined_case(row, title_prefix, filename):
+def plot_deep_dive(row, title_prefix, filename, dataset_name, cap_size):
     """
-    Plots Price vs Allocation on a single chart for clarity.
+    Generates a rich visualization comprising Price, Predictions, and Allocations.
     """
-    prices = row['true_prices_std']
-    alloc_static = row['alloc_std']
-    alloc_cont = row['alloc_cont']
+    # Data Extraction
+    true_prices = np.array(row['true_prices_std'])
+    pred_static = np.array(row['pred_prices_std']) if 'pred_prices_std' in row else None
+    pred_cont   = np.array(row['pred_prices_cont']) if 'pred_prices_cont' in row else None
+    alloc_static = np.array(row['alloc_std'])
+    alloc_cont   = np.array(row['alloc_cont'])
     
     # Sync lengths
-    min_len = min(len(prices), len(alloc_static), len(alloc_cont))
-    prices = prices[:min_len]
+    min_len = len(true_prices)
+    if pred_static is not None: min_len = min(min_len, len(pred_static))
+    if pred_cont is not None: min_len = min(min_len, len(pred_cont))
+    min_len = min(min_len, len(alloc_static), len(alloc_cont))
+    
+    # Trim data
+    steps = np.arange(min_len)
+    true_prices = true_prices[:min_len]
+    if pred_static is not None: pred_static = pred_static[:min_len]
+    if pred_cont is not None: pred_cont = pred_cont[:min_len]
     alloc_static = alloc_static[:min_len]
     alloc_cont = alloc_cont[:min_len]
-    steps = np.arange(len(prices))
 
-    # Create Figure
-    fig, ax1 = plt.subplots(figsize=(12, 7))
+    # --- PLOT SETUP ---
+    fig, ax1 = plt.subplots(figsize=(14, 8))
     
-    # --- PLOT 1: PRICE (Line) ---
-    color_price = '#333333'
+    # 1. PRICES (Left Axis)
     ax1.set_xlabel('Time Step')
-    ax1.set_ylabel('Asset Price', color=color_price, fontsize=12)
-    ax1.plot(steps, prices, color=color_price, linewidth=2.5, label='True Price', zorder=10)
-    ax1.tick_params(axis='y', labelcolor=color_price)
+    ax1.set_ylabel('Asset Price', color='#333333', fontsize=12)
+    ax1.grid(True, linestyle=':', alpha=0.6)
     
-    # Highlight Min Price
-    min_price_idx = np.argmin(prices)
-    ax1.scatter(min_price_idx, prices[min_price_idx], color='gold', edgecolor='black', s=100, zorder=11, label="Lowest Price")
+    # Ground Truth
+    ax1.plot(steps, true_prices, color='black', linewidth=2.5, label='Ground Truth', zorder=10)
+    
+    # Predictions
+    if pred_static is not None:
+        ax1.plot(steps, pred_static, color='#d62728', linestyle='--', linewidth=1.5, alpha=0.8, label='Static Forecast (t=0)')
+    if pred_cont is not None:
+        ax1.plot(steps, pred_cont, color='#2ca02c', linestyle=':', linewidth=2.0, alpha=0.9, label='Rolling Forecast (MPC)')
 
-    # --- PLOT 2: ALLOCATIONS (Bars) ---
-    ax2 = ax1.twinx()  # Instantiate a second axes that shares the same x-axis
-    ax2.set_ylabel('Allocation Amount (Fraction of Budget)', color='#555555', fontsize=12)
-    
-    # Offset bars so they don't overlap
-    width = 0.35
-    ax2.bar(steps - width/2, alloc_static, width, color='#d62728', alpha=0.6, label=f'Static (Cap 1.0)')
-    ax2.bar(steps + width/2, alloc_cont, width, color='#2ca02c', alpha=0.7, label=f'Continuous (Cap {BEST_CAP})')
-    
-    # Limits & Style
+    # 2. ALLOCATIONS (Right Axis)
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Allocation Amount', color='#555555', fontsize=12)
     ax2.set_ylim(0, 1.1)
-    ax2.spines['top'].set_visible(False)
     
-    # Combined Legend
+    # Bar Plots
+    width = 0.35
+    ax2.bar(steps - width/2, alloc_static, width, color='#d62728', alpha=0.3, label='Static Buy (Baseline)')
+    ax2.bar(steps + width/2, alloc_cont, width, color='#2ca02c', alpha=0.5, label='Continuous Buy (Ours)')
+
+    # --- FINAL POLISH ---
+    # Create unified legend
     lines_1, labels_1 = ax1.get_legend_handles_labels()
     lines_2, labels_2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left', frameon=True, fancybox=True, shadow=True)
-
-    # Title with Stats
-    diff = row['diff']
-    res_type = "WIN" if diff > 0 else "LOSS"
-    plt.title(f"{title_prefix} | Case #{row['case_id']} | {res_type} (Saved: {diff:.2f})", fontsize=14, fontweight='bold', pad=20)
     
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left', 
+               frameon=True, fancybox=True, shadow=True, ncol=2)
+    
+    # Stats Box
+    saved_money = row['regret_std'] - row['regret_cont']
+    imp_pct = (saved_money / row['regret_std']) * 100 if row['regret_std'] != 0 else 0
+    
+    stats_text = (
+        f"Case #{row['case_id']}\n"
+        f"Saved: {saved_money:.4f} ({imp_pct:+.1f}%)\n"
+        f"Static Cost: {row['regret_std']:.4f}\n"
+        f"Ours Cost:   {row['regret_cont']:.4f}"
+    )
+    
+    props = dict(boxstyle='round', facecolor='white', alpha=0.9)
+    ax1.text(0.98, 0.02, stats_text, transform=ax1.transAxes, fontsize=11,
+             verticalalignment='bottom', horizontalalignment='right', bbox=props)
+
+    plt.title(f"{title_prefix} | {dataset_name.upper()} | Best Cap {cap_size}", fontsize=16, fontweight='bold', pad=15)
     plt.tight_layout()
+    
+    # Save
     plt.savefig(filename, dpi=200)
     plt.close()
-    print(f"  [Saved] {filename}")
+    print(f"    -> [Saved] {os.path.basename(filename)}")
 
 # ==========================================
-# MAIN
+# MAIN LOGIC
 # ==========================================
 def run_analysis():
-    print(f"Finding representative cases for {DATASET}...")
+    print(f"{'='*60}")
+    print(f" BATCH VISUALIZATION & WIN-RATE ANALYSIS")
+    print(f"{'='*60}")
     
-    # Paths
-    base_path_1 = os.path.join("output", "PatchTST", f"{DATASET}_pno_{BASELINE_CAP}cap", "cases_test", "pno_cases.jsonl")
-    base_path_2 = os.path.join("output", "PatchTST", f"{DATASET}_pno", "cases_test", "pno_cases.jsonl")
-    path_std = base_path_1 if os.path.exists(base_path_1) else base_path_2
-    
-    path_cont = os.path.join("output", "PatchTST", f"{DATASET}_mpc_{BEST_CAP}cap", "cases_test", "mpc_cases.jsonl")
+    results_summary = []
 
-    # Load & Merge
-    df_std = load_json_lines(path_std)
-    df_cont = load_json_lines(path_cont)
-    if df_std is None or df_cont is None: return
+    for dataset, best_cap in DATASET_CONFIGS.items():
+        print(f"\nProcessing: {dataset.upper()} (Best Cap: {best_cap})...")
+        
+        # Paths
+        path_std_1 = os.path.join("output", "PatchTST", f"{dataset}_pno_{BASELINE_CAP}cap", "cases_test", "pno_cases.jsonl")
+        path_std_2 = os.path.join("output", "PatchTST", f"{dataset}_pno", "cases_test", "pno_cases.jsonl")
+        path_std = path_std_1 if os.path.exists(path_std_1) else path_std_2
+        
+        path_cont = os.path.join("output", "PatchTST", f"{dataset}_mpc_{best_cap}cap", "cases_test", "mpc_cases.jsonl")
 
-    df_std = df_std.rename(columns={'regret': 'regret_std', 'alloc': 'alloc_std', 'true_prices': 'true_prices_std'})
-    df_cont = df_cont.rename(columns={'regret': 'regret_cont', 'alloc': 'alloc_cont'})
-    
-    df = pd.merge(df_std[['case_id', 'regret_std', 'alloc_std', 'true_prices_std']], 
-                  df_cont[['case_id', 'regret_cont', 'alloc_cont']], on='case_id')
-    
-    # Calculate Savings (Positive = Good)
-    df['diff'] = df['regret_std'] - df['regret_cont']
-    
-    # Separate Wins and Losses
-    wins = df[df['diff'] > 0].sort_values(by='diff')
-    losses = df[df['diff'] < 0].sort_values(by='diff')
+        if not os.path.exists(path_std) or not os.path.exists(path_cont):
+            print(f"  [Skip] Logs not found for {dataset}.")
+            continue
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+        # Load & Merge
+        df_std = load_json_lines(path_std)
+        df_cont = load_json_lines(path_cont)
+        
+        # Rename columns
+        df_std = df_std.rename(columns={'regret': 'regret_std', 'alloc': 'alloc_std', 
+                                        'true_prices': 'true_prices_std', 'pred_prices': 'pred_prices_std'})
+        df_cont = df_cont.rename(columns={'regret': 'regret_cont', 'alloc': 'alloc_cont', 
+                                          'true_prices': 'true_prices_cont', 'pred_prices': 'pred_prices_cont'})
+        
+        # Merge
+        df = pd.merge(df_std, df_cont, on='case_id')
+        
+        # --- CALCULATE STATISTICS ---
+        # "Win" = Continuous Regret < Static Regret
+        df['diff'] = df['regret_std'] - df['regret_cont']
+        
+        total_cases = len(df)
+        wins_count = len(df[df['diff'] > 0])
+        draws_count = len(df[df['diff'] == 0])
+        losses_count = len(df[df['diff'] < 0])
+        
+        win_rate = (wins_count / total_cases) * 100
+        
+        print(f"  > Total Cases: {total_cases}")
+        print(f"  > Wins: {wins_count} ({win_rate:.2f}%)")
+        print(f"  > Losses: {losses_count}")
+        
+        results_summary.append({
+            "Dataset": dataset,
+            "Best Cap": best_cap,
+            "Win Rate": f"{win_rate:.2f}%"
+        })
 
-    # --- SELECTION LOGIC: "Representative" means not the extreme tail ---
-    
-    # 1. Strong Win (90th Percentile) - Shows high performance, but filters likely glitches
-    if not wins.empty:
-        idx_90 = int(len(wins) * 0.90)
-        row = wins.iloc[idx_90]
-        plot_combined_case(row, "Strong Win (90th %)", os.path.join(OUTPUT_DIR, "Win_Strong_Representative.png"))
+        # --- GENERATE GRAPHS ---
+        output_dir = os.path.join(OUTPUT_BASE_DIR, dataset)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        wins = df[df['diff'] > 0].sort_values(by='diff')
+        losses = df[df['diff'] < 0].sort_values(by='diff')
 
-    # 2. Typical Win (Median) - Shows the "average day" improvement
-    if not wins.empty:
-        idx_50 = int(len(wins) * 0.50)
-        row = wins.iloc[idx_50]
-        plot_combined_case(row, "Typical Win (Median)", os.path.join(OUTPUT_DIR, "Win_Typical_Median.png"))
+        if not wins.empty:
+            # Strong Win (60th Percentile - Good but not outlier)
+            idx = int(len(wins) * 0.60)
+            plot_deep_dive(wins.iloc[idx], "Strong Win", os.path.join(output_dir, "Case_Win_Strong.png"), dataset, best_cap)
+            
+            # Median Win
+            idx = int(len(wins) * 0.50)
+            plot_deep_dive(wins.iloc[idx], "Typical Win", os.path.join(output_dir, "Case_Win_Median.png"), dataset, best_cap)
 
-    # 3. Typical Loss (Median) - Shows where it normally struggles
-    if not losses.empty:
-        idx_50 = int(len(losses) * 0.50)
-        row = losses.iloc[idx_50]
-        plot_combined_case(row, "Typical Loss (Median)", os.path.join(OUTPUT_DIR, "Loss_Typical_Median.png"))
+        if not losses.empty:
+            # Median Loss
+            idx = int(len(losses) * 0.50)
+            plot_deep_dive(losses.iloc[idx], "Typical Loss", os.path.join(output_dir, "Case_Loss_Median.png"), dataset, best_cap)
+
+    # --- FINAL TABLE PRINT ---
+    print(f"\n{'='*60}")
+    print(f"{'Dataset':<15} | {'Best Cap':<10} | {'Win Rate (vs Static)':<20}")
+    print("-" * 60)
+    for res in results_summary:
+        print(f"{res['Dataset']:<15} | {str(res['Best Cap']):<10} | {res['Win Rate']:<20}")
+    print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     run_analysis()
