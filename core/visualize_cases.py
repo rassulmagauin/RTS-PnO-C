@@ -10,14 +10,13 @@ import json
 # CONFIGURATION
 # ==========================================
 # Map each dataset to its BEST performing Cap size
-# (Derived from your sensitivity analysis)
 DATASET_CONFIGS = {
     "usdcny":   0.75,
     "audusd":   0.25,
     "usdjpy":   0.7,
     "sp500":    0.9,
-    "coinbase": 0.75, # Best attempt (even if overall loss)
-    "djia":     0.7   # Best attempt
+    "coinbase": 0.75, 
+    "djia":     0.7   
 }
 
 BASELINE_CAP = 1.0 
@@ -62,26 +61,28 @@ def plot_deep_dive(row, title_prefix, filename, dataset_name, cap_size):
     alloc_cont = alloc_cont[:min_len]
 
     # --- PLOT SETUP ---
-    fig, ax1 = plt.subplots(figsize=(14, 8))
+    fig, ax1 = plt.subplots(figsize=(15, 9)) # Slightly larger figure
     
     # 1. PRICES (Left Axis)
-    ax1.set_xlabel('Time Step')
-    ax1.set_ylabel('Asset Price', color='#333333', fontsize=12)
-    ax1.grid(True, linestyle=':', alpha=0.6)
+    ax1.set_xlabel('Time Step', fontsize=18, fontweight='bold', labelpad=10)
+    ax1.set_ylabel('Asset Price', color='black', fontsize=18, fontweight='bold', labelpad=10)
+    ax1.grid(True, linestyle=':', alpha=0.5)
+    ax1.tick_params(axis='both', which='major', labelsize=14) # Bigger ticks
     
     # Ground Truth
-    ax1.plot(steps, true_prices, color='black', linewidth=2.5, label='Ground Truth', zorder=10)
+    ax1.plot(steps, true_prices, color='black', linewidth=3.0, label='Ground Truth', zorder=10)
     
     # Predictions
     if pred_static is not None:
-        ax1.plot(steps, pred_static, color='#d62728', linestyle='--', linewidth=1.5, alpha=0.8, label='Static Forecast (t=0)')
+        ax1.plot(steps, pred_static, color='#d62728', linestyle='--', linewidth=2.0, alpha=0.8, label='Static Forecast (t=0)')
     if pred_cont is not None:
-        ax1.plot(steps, pred_cont, color='#2ca02c', linestyle=':', linewidth=2.0, alpha=0.9, label='Rolling Forecast (MPC)')
+        ax1.plot(steps, pred_cont, color='#2ca02c', linestyle=':', linewidth=2.5, alpha=0.9, label='Rolling Forecast (MPC)')
 
     # 2. ALLOCATIONS (Right Axis)
     ax2 = ax1.twinx()
-    ax2.set_ylabel('Allocation Amount', color='#555555', fontsize=12)
-    ax2.set_ylim(0, 1.1)
+    ax2.set_ylabel('Allocation Amount', color='#555555', fontsize=18, fontweight='bold', labelpad=10)
+    ax2.set_ylim(0, 1.15) # Slight increase to prevent bar overlap with legend
+    ax2.tick_params(axis='y', labelsize=14, labelcolor='#555555')
     
     # Bar Plots
     width = 0.35
@@ -93,8 +94,9 @@ def plot_deep_dive(row, title_prefix, filename, dataset_name, cap_size):
     lines_1, labels_1 = ax1.get_legend_handles_labels()
     lines_2, labels_2 = ax2.get_legend_handles_labels()
     
+    # Increased Legend Font
     ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left', 
-               frameon=True, fancybox=True, shadow=True, ncol=2)
+               frameon=True, fancybox=True, shadow=True, ncol=2, fontsize=14)
     
     # Stats Box
     saved_money = row['regret_std'] - row['regret_cont']
@@ -107,11 +109,13 @@ def plot_deep_dive(row, title_prefix, filename, dataset_name, cap_size):
         f"Ours Cost:   {row['regret_cont']:.4f}"
     )
     
-    props = dict(boxstyle='round', facecolor='white', alpha=0.9)
-    ax1.text(0.98, 0.02, stats_text, transform=ax1.transAxes, fontsize=11,
-             verticalalignment='bottom', horizontalalignment='right', bbox=props)
+    props = dict(boxstyle='round', facecolor='white', alpha=0.95, edgecolor='#333333')
+    # Increased Stats Box Font
+    ax1.text(0.98, 0.02, stats_text, transform=ax1.transAxes, fontsize=14,
+             verticalalignment='bottom', horizontalalignment='right', bbox=props, zorder=100)
 
-    plt.title(f"{title_prefix} | {dataset_name.upper()} | Best Cap {cap_size}", fontsize=16, fontweight='bold', pad=15)
+    # Increased Title Font
+    plt.title(f"{title_prefix} | {dataset_name.upper()} | Best Cap {cap_size}", fontsize=22, fontweight='bold', pad=20)
     plt.tight_layout()
     
     # Save
@@ -124,7 +128,7 @@ def plot_deep_dive(row, title_prefix, filename, dataset_name, cap_size):
 # ==========================================
 def run_analysis():
     print(f"{'='*60}")
-    print(f" BATCH VISUALIZATION & WIN-RATE ANALYSIS")
+    print(f" BATCH VISUALIZATION & WIN-RATE ANALYSIS (Large Fonts)")
     print(f"{'='*60}")
     
     results_summary = []

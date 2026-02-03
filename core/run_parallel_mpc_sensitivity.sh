@@ -5,7 +5,7 @@
 # ==============================================================================
 
 # 1. Define Datasets and Caps
-DATASETS=("usdcny" "coinbase" "audusd" "djia" "sp500" "usdjpy")
+DATASETS=("usdrub" "usdtwd" "usdbdt" "usdfjd" "usdsgd")
 CAPS=(0.1 0.2 0.25 0.3 0.4 0.5 0.6 0.7 0.75 0.8 0.9 1.0)
 PYTHON_EXEC="python"
 
