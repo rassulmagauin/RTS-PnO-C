@@ -9,6 +9,14 @@ import torch
 
 from allocate.experiment_pno import PnOExperiment
 
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+import torch
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True, warn_only=True)
+
 def run_experiment(configs):
     # Fix random seed to ensure reproducibility
     random.seed(configs.random_seed)
@@ -38,9 +46,9 @@ if __name__ == '__main__':
     # Remove the previous experiment with the same `exp_id`.
     exp_dir = os.path.join('output', configs['Experiment']['exp_id'])
     if os.path.exists(exp_dir):
-        print(f'Experiment {exp_dir} exists, delete and continue? [Y/N]', end=' ')
+        # print(f'Experiment {exp_dir} exists, delete and continue? [Y/N]', end=' ')
 
-        response = input()
+        response = 'Y'
         while response not in ['Y', 'N']:
             print('Invalid choice. Choose between [Y/N]', end=' ')
             response = input()

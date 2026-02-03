@@ -1,16 +1,22 @@
 Experiment:
-    exp_id: PatchTST/audusd_pno
+    exp_id: PatchTST/usdcny_mpc
+    # This MUST match the folder name of your baseline run
+    prev_exp_id: PatchTST/usdcny_pno
+    # The constraint: "Spend at most 25% of remaining budget per step"
+    mpc_first_step_cap: 0.25  
+
 Hardware:
     random_seed: 2021
-    num_workers: 1
+    num_workers: 1       
     gpu: 0
     use_multi_gpu: false
     gpus: null
+
 Dataset:
     root_path: ../dataset
     data_path: exchange_rate_600s.csv
     task_type: U
-    univariate: audusd
+    univariate: usdcny
     date_col: transact_time
     n_vars: 1
     seq_len: 440
@@ -19,6 +25,7 @@ Dataset:
     interval: 1
     standardize: true
     enc_freq: null
+
 Model:
     model: PatchTST
     decomp: false
@@ -37,15 +44,8 @@ Model:
     activation: gelu
     dropout: 0.3
     shared_proj: true
+
 Allocate:
-    criterion: MSE+SPO+
-    criterion_weight: 1
-    train_epochs: 100
-    uncertainty_quantile: 1
-    patience: 3
+    # Must match the quantile used in PnO baseline
+    uncertainty_quantile: 0.3
     batch_size: 32
-    lr: 0.0001
-    lr_scheduler: fixed
-    load_prev_weights: false
-Conformal:
-    error_rate: 0.05
